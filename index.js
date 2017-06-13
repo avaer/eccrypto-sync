@@ -5,21 +5,9 @@
 
 "use strict";
 
-var promise = typeof Promise === "undefined" ?
-              require("es6-promise").Promise :
-              Promise;
 var crypto = require("crypto");
-// try to use secp256k1, fallback to browser implementation
-try {
-  var secp256k1 = require("secp256k1");
-  var ecdh = require("./build/Release/ecdh");
-} catch (e) {
-  if (process.env.ECCRYPTO_NO_FALLBACK) {
-    throw e;
-  } else {
-    return (module.exports = require("./browser"));
-  }
-}
+
+var secp256k1 = require('./secp256k1');
 
 function assert(condition, message) {
   if (!condition) {
@@ -81,9 +69,7 @@ function pad32(msg){
  */
 var getPublic = exports.getPublic = function(privateKey) {
   assert(privateKey.length === 32, "Bad private key");
-  // See https://github.com/wanderer/secp256k1-node/issues/46
-  var compressed = secp256k1.publicKeyCreate(privateKey);
-  return secp256k1.publicKeyConvert(compressed, false);
+  return new Buffer(secp256k1.keyFromPrivate(privateKey).getPublic(false, 'hex'), 'hex');
 };
 
 /**
@@ -94,13 +80,10 @@ var getPublic = exports.getPublic = function(privateKey) {
  * signature and rejects on bad key or message.
  */
 exports.sign = function(privateKey, msg) {
-  return new promise(function(resolve) {
-    assert(msg.length > 0, "Message should not be empty");
-    assert(msg.length <= 32, "Message is too long");
-    msg = pad32(msg);
-    var sig = secp256k1.signSync(msg, privateKey).signature;
-    resolve(secp256k1.signatureExport(sig));
-  });
+  assert(msg.length > 0, "Message should not be empty");
+  assert(msg.length <= 32, "Message is too long");
+  msg = pad32(msg);
+  return Buffer.from(secp256k1.sign(msg, privateKey).toDER());
 };
 
 /**
@@ -112,17 +95,10 @@ exports.sign = function(privateKey, msg) {
  * and rejects on bad key or signature.
  */
 exports.verify = function(publicKey, msg, sig) {
-  return new promise(function(resolve, reject) {
-    assert(msg.length > 0, "Message should not be empty");
-    assert(msg.length <= 32, "Message is too long");
-    msg = pad32(msg);
-    sig = secp256k1.signatureImport(sig);
-    if (secp256k1.verifySync(msg, sig, publicKey)) {
-     resolve(null);
-    } else {
-     reject(new Error("Bad signature"));
-    }
-  });
+  assert(msg.length > 0, "Message should not be empty");
+  assert(msg.length <= 32, "Message is too long");
+  msg = pad32(msg);
+  return secp256k1.verify(msg, sig, secp256k1.keyFromPublic(publicKey));
 };
 
 /**
@@ -133,9 +109,10 @@ exports.verify = function(publicKey, msg, sig) {
  * shared secret (Px, 32 bytes) and rejects on bad key.
  */
 var derive = exports.derive = function(privateKeyA, publicKeyB) {
-  return new promise(function(resolve) {
-    resolve(ecdh.derive(privateKeyA, publicKeyB));
-  });
+  return secp256k1.keyFromPrivate(privateKeyA)
+    .derive(
+      secp256k1.keyFromPublic(publicKeyB).getPublic()
+    ).toBuffer();
 };
 
 /**
@@ -159,27 +136,23 @@ var derive = exports.derive = function(privateKeyA, publicKeyB) {
  */
 exports.encrypt = function(publicKeyTo, msg, opts) {
   opts = opts || {};
-  // Tmp variable to save context from flat promises;
-  var ephemPublicKey;
-  return new promise(function(resolve) {
-    var ephemPrivateKey = opts.ephemPrivateKey || crypto.randomBytes(32);
-    ephemPublicKey = getPublic(ephemPrivateKey);
-    resolve(derive(ephemPrivateKey, publicKeyTo));
-  }).then(function(Px) {
-    var hash = sha512(Px);
-    var iv = opts.iv || crypto.randomBytes(16);
-    var encryptionKey = hash.slice(0, 32);
-    var macKey = hash.slice(32);
-    var ciphertext = aes256CbcEncrypt(iv, encryptionKey, msg);
-    var dataToMac = Buffer.concat([iv, ephemPublicKey, ciphertext]);
-    var mac = hmacSha256(macKey, dataToMac);
-    return {
-      iv: iv,
-      ephemPublicKey: ephemPublicKey,
-      ciphertext: ciphertext,
-      mac: mac,
-    };
-  });
+
+  var ephemPrivateKey = opts.ephemPrivateKey || crypto.randomBytes(32);
+  var ephemPublicKey = getPublic(ephemPrivateKey);
+  var Px = derive(ephemPrivateKey, publicKeyTo);
+  var hash = sha512(Px);
+  var iv = opts.iv || crypto.randomBytes(16);
+  var encryptionKey = hash.slice(0, 32);
+  var macKey = hash.slice(32);
+  var ciphertext = aes256CbcEncrypt(iv, encryptionKey, msg);
+  var dataToMac = Buffer.concat([iv, ephemPublicKey, ciphertext]);
+  var mac = hmacSha256(macKey, dataToMac);
+  return {
+    iv: iv,
+    ephemPublicKey: ephemPublicKey,
+    ciphertext: ciphertext,
+    mac: mac,
+  };
 };
 
 /**
@@ -191,17 +164,20 @@ exports.encrypt = function(publicKeyTo, msg, opts) {
  * plaintext on successful decryption and rejects on failure.
  */
 exports.decrypt = function(privateKey, opts) {
-  return derive(privateKey, opts.ephemPublicKey).then(function(Px) {
-    var hash = sha512(Px);
-    var encryptionKey = hash.slice(0, 32);
-    var macKey = hash.slice(32);
-    var dataToMac = Buffer.concat([
-      opts.iv,
-      opts.ephemPublicKey,
-      opts.ciphertext
-    ]);
-    var realMac = hmacSha256(macKey, dataToMac);
-    assert(equalConstTime(opts.mac, realMac), "Bad MAC");
-    return aes256CbcDecrypt(opts.iv, encryptionKey, opts.ciphertext);
-  });
+  var Px = derive(privateKey, opts.ephemPublicKey);
+  var hash = sha512(Px);
+  var encryptionKey = hash.slice(0, 32);
+  var macKey = hash.slice(32);
+  var dataToMac = Buffer.concat([
+    opts.iv,
+    opts.ephemPublicKey,
+    opts.ciphertext
+  ]);
+  var realMac = hmacSha256(macKey, dataToMac);
+  assert(equalConstTime(opts.mac, realMac), "Bad MAC");
+  return aes256CbcDecrypt(opts.iv, encryptionKey, opts.ciphertext);
+};
+
+exports.getPublicKeyFromPrivateKey = function(privateKey) {
+  return Buffer.from(secp256k1.keyFromPrivate(privateKey).getPublic('arr'));
 };
